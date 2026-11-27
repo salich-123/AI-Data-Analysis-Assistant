@@ -1,4 +1,3 @@
-
 def analyze_data(df):
 
     print("\n========== DATA ANALYSIS ==========")
