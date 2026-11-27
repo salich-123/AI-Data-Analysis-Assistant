@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import re
 import hashlib
-
+from agents.gemini_agent import ask_gemini
 # --------------------------------------------------
 # PAGE CONFIGURATION
 # --------------------------------------------------
@@ -343,60 +343,197 @@ def clean_dataset(data):
 # --------------------------------------------------
 # QUESTION ANSWERING
 # --------------------------------------------------
-
 def answer_question(data, question):
     df = data.copy()
     q = question.lower().strip()
 
     numeric_columns = df.select_dtypes(include="number").columns.tolist()
 
+    # Detect the column mentioned in the question
     column = None
-
-    for col in df.columns:
-        if str(col).lower() in q:
+    for col in sorted(df.columns, key=lambda x: len(str(x)), reverse=True):
+        if re.search(r"(?<!\w)" + re.escape(str(col).lower()) + r"(?!\w)", q):
             column = col
             break
 
+    # 1. Dynamic record filtering
+    if column is not None:
+        col_pattern = re.escape(str(column))
+
+        # Numeric comparison operators
+        operators = {
+            "greater than or equal to": ">=",
+            "at least": ">=",
+            "less than or equal to": "<=",
+            "at most": "<=",
+            "greater than": ">",
+            "more than": ">",
+            "above": ">",
+            "over": ">",
+            "less than": "<",
+            "below": "<",
+            "under": "<",
+            "equal to": "==",
+            "equals": "==",
+        }
+
+        operator_pattern = "|".join(
+            re.escape(op) for op in sorted(operators, key=len, reverse=True)
+        )
+
+        numeric_match = re.search(
+            col_pattern + r"\s+(?:is\s+)?(" + operator_pattern +
+            r"|>=|<=|>|<|=)\s*(-?\d+(?:\.\d+)?)",
+            q
+        )
+
+        if numeric_match:
+            operator = numeric_match.group(1)
+            value = float(numeric_match.group(2))
+            operator = operators.get(operator, operator)
+
+            values = pd.to_numeric(df[column], errors="coerce")
+
+            if operator == ">":
+                result = df[values > value]
+            elif operator == "<":
+                result = df[values < value]
+            elif operator == ">=":
+                result = df[values >= value]
+            elif operator == "<=":
+                result = df[values <= value]
+            else:
+                result = df[values == value]
+
+            return (
+                f"Found {len(result)} matching records:\n\n"
+                + result.to_string(index=False)
+                if not result.empty
+                else f"No records found where {column} {operator} {value}"
+            )
+
+        # Text or exact-value filtering
+        exact_match = re.search(
+            col_pattern + r"\s+(?:is|equals|equal to|=|:)\s*(.+?)\s*$",
+            q
+        )
+
+        if exact_match:
+            value = exact_match.group(1).strip().strip("'\"").rstrip("?.!")
+
+            result = df[
+                df[column].astype(str).str.strip().str.casefold()
+                == value.casefold()
+            ]
+
+            if not result.empty:
+                return (
+                    f"Found {len(result)} matching records:\n\n"
+                    + result.to_string(index=False)
+                )
+
+            # Also allow partial text matches
+            result = df[
+                df[column].astype(str).str.contains(
+                    re.escape(value), case=False, na=False
+                )
+            ]
+
+            if not result.empty:
+                return (
+                    f"Found {len(result)} matching records:\n\n"
+                    + result.to_string(index=False)
+                )
+
+            return f"No records found for {column} = {value}"
+
+    # 2. Total records
     if any(word in q for word in [
         "total rows", "total records", "number of rows",
-        "how many rows", "how many records"
+        "how many rows", "how many records", "count records"
     ]):
         return f"Total records: {len(df)}"
 
+    # 3. Total columns
     if any(word in q for word in [
         "total columns", "number of columns", "how many columns"
     ]):
         return f"Total columns: {len(df.columns)}"
 
-    if "missing" in q or "null" in q or "empty" in q:
+    # 4. Missing values
+    if any(word in q for word in ["missing", "null values", "empty values"]):
         if column is not None:
             return f"Missing values in {column}: {df[column].isnull().sum()}"
-
         return df.isnull().sum().to_string()
 
+    # 5. Duplicate records
     if "duplicate" in q:
-        return f"Duplicate rows: {df.duplicated().sum()}"
+        return f"Duplicate records: {df.duplicated().sum()}"
 
+    # 6. Correlation
     if "correlation" in q or "correlate" in q:
         mentioned = [
-            col for col in numeric_columns
-            if str(col).lower() in q
+            c for c in numeric_columns if str(c).lower() in q
         ]
 
         if len(mentioned) >= 2:
             value = df[mentioned[0]].corr(df[mentioned[1]])
-            return (
-                f"Correlation between {mentioned[0]} and "
-                f"{mentioned[1]}: {value:.3f}"
-            )
+            return f"Correlation between {mentioned[0]} and {mentioned[1]}: {value:.3f}"
 
         if len(numeric_columns) >= 2:
             return df[numeric_columns].corr().round(3).to_string()
 
         return "At least two numeric columns are required."
 
-    if column is not None and column in numeric_columns:
+    # 7. Grouped analysis: total Sales by Region
+    group_match = re.search(r"\bby\s+(.+?)\s*$", q)
 
+    if group_match and any(word in q for word in ["total", "sum", "average", "mean", "count"]):
+        group_text = group_match.group(1).strip()
+
+        group_col = next(
+            (c for c in df.columns if str(c).lower() == group_text),
+            None
+        )
+
+        value_col = next(
+            (c for c in numeric_columns if str(c).lower() in q),
+            None
+        )
+
+        if group_col is not None:
+            if "count" in q:
+                return df.groupby(group_col).size().to_string()
+
+            if value_col is not None:
+                if "average" in q or "mean" in q:
+                    return df.groupby(group_col)[value_col].mean().to_string()
+
+                return df.groupby(group_col)[value_col].sum().to_string()
+    
+    # 8. Top and bottom records
+    if any(word in q for word in ["top", "highest", "maximum", "most"]):
+        if column is not None and column in numeric_columns:
+            numbers = re.findall(r"\d+", q)
+            count = int(numbers[0]) if numbers else 1
+            result = df.nlargest(count, column)
+            return (
+                f"Highest {column}:\n"
+                + result.to_string(index=False)
+            )
+
+    if any(word in q for word in ["bottom", "lowest", "minimum", "least"]):
+        if column is not None and column in numeric_columns:
+            numbers = re.findall(r"\d+", q)
+            count = int(numbers[0]) if numbers else 1
+            result = df.nsmallest(count, column)
+            return (
+                f"Lowest {column}:\n"
+                + result.to_string(index=False)
+            )
+
+    # 9. Numeric calculations
+    if column in numeric_columns:
         if "average" in q or "mean" in q:
             return f"Average {column}: {df[column].mean():.2f}"
 
@@ -406,49 +543,46 @@ def answer_question(data, question):
         if "standard deviation" in q or "std" in q:
             return f"Standard deviation of {column}: {df[column].std():.2f}"
 
-        if "highest" in q or "maximum" in q:
+        if "sum" in q or "total" in q:
+            return f"Total {column}: {df[column].sum():.2f}"
+
+        if "maximum" in q or "highest" in q:
             return f"Maximum {column}: {df[column].max()}"
 
-        if "lowest" in q or "minimum" in q:
+        if "minimum" in q or "lowest" in q:
             return f"Minimum {column}: {df[column].min()}"
-
-        if "sum" in q or "total" in q:
-            return f"Total {column}: {df[column].sum()}"
 
         if "summary" in q or "describe" in q:
             return df[column].describe().to_string()
 
-    if "average" in q or "mean" in q:
-        if numeric_columns:
-            return df[numeric_columns].mean().round(2).to_string()
-
-        return "No numeric columns found."
-
-    if "top" in q:
-        numbers = re.findall(r"\d+", q)
-        count = int(numbers[0]) if numbers else 5
-
-        if column in numeric_columns:
-            return df.nlargest(count, column).to_string(index=False)
-
-        return "Mention a numeric column. Example: Top 5 by Sales."
-
+    # 10. Unique values
     if "unique" in q or "distinct" in q:
         if column is not None:
-            return str(df[column].unique().tolist())
-
+            return str(df[column].dropna().unique().tolist())
         return df.nunique().to_string()
 
+    # 11. Sorting
+    if "sort" in q or "order" in q:
+        if column is not None:
+            ascending = not any(
+                word in q for word in ["descending", "highest", "largest"]
+            )
+            return df.sort_values(
+                by=column, ascending=ascending
+            ).to_string(index=False)
+
+    # 12. General help
     return (
         "I could not understand that question.\n\n"
-        "Try:\n"
-        "- What is the total number of records?\n"
-        "- Show missing values.\n"
-        "- Find duplicate rows.\n"
-        "- What is the average Sales?\n"
-        "- Find the correlation between Sales and Profit."
+        "Examples:\n"
+        "- Show records where sales_rep is Bob\n"
+        "- Show records where Quantity_Sold is above 20\n"
+        "- Show records where Sales is less than 500\n"
+        "- What is the total Sales?\n"
+        "- What is the average Profit?\n"
+        "- Show top 5 by Sales\n"
+        "- Show total Sales by Region"
     )
-
 
 # --------------------------------------------------
 # SIDEBAR
@@ -562,6 +696,7 @@ if df.empty:
 # OVERVIEW
 # --------------------------------------------------
 
+
 if page == "Overview":
 
     hero(
@@ -584,44 +719,12 @@ if page == "Overview":
 
     st.write("")
 
-    left, right = st.columns([1.5, 1])
-
-    with left:
-        with st.container(border=True):
-            section_heading(
-                "Dataset preview",
-                "Your first ten records."
-            )
-            st.dataframe(df.head(10), width="stretch")
-
-    with right:
-        with st.container(border=True):
-            section_heading(
-                "Column profile",
-                "Data types in your dataset."
-            )
-
-            info = pd.DataFrame({
-                "Column": df.columns.astype(str),
-                "Type": df.dtypes.astype(str).values,
-                "Missing": df.isnull().sum().values
-            })
-
-            st.dataframe(info, width="stretch", height=330)
-
     with st.container(border=True):
         section_heading(
-            "Data quality overview",
-            "Missing values across your columns."
+            "Dataset preview",
+            "Your first ten records."
         )
-
-        missing = df.isnull().sum()
-        missing = missing[missing > 0]
-
-        if not missing.empty:
-            st.bar_chart(missing)
-        else:
-            st.success("Excellent! No missing values found.")
+        st.dataframe(df.head(10), width="stretch")
 
 
 # --------------------------------------------------
@@ -716,20 +819,44 @@ elif page == "Analysis & Charts":
 
         section_heading(
             "Statistical intelligence",
-            "A summary of your numerical columns."
+            "Choose a calculation and numerical column."
         )
 
         with st.container(border=True):
-            st.dataframe(
-                cleaned[numeric_columns].describe(),
-                width="stretch"
+
+            stat_options = {
+                "Average": "mean",
+                "Sum": "sum",
+                "Maximum": "max",
+                "Minimum": "min",
+                "Median": "median",
+                "Standard Deviation": "std",
+                "Variance": "var",
+                "Count": "count"
+            }
+
+            col1, col2 = st.columns(2)
+
+            selected_stat = col1.selectbox(
+                "Select calculation",
+                list(stat_options.keys()),
+                key="stat_calculation"
             )
 
-        with st.container(border=True):
-            st.subheader("Average values")
-            st.dataframe(
-                cleaned[numeric_columns].mean().to_frame("Average"),
-                width="stretch"
+            selected_column = col2.selectbox(
+                "Select numerical column",
+                numeric_columns,
+                key="stat_column"
+            )
+
+            result = getattr(
+                cleaned[selected_column],
+                stat_options[selected_stat]
+            )()
+
+            st.metric(
+                f"{selected_stat} of {selected_column}",
+                f"{result:,.2f}" if pd.notna(result) else "Not available"
             )
 
     st.divider()
@@ -1062,24 +1189,45 @@ elif page == "AI Assistant":
 
             question = st.text_input(
                 "What would you like to know?",
-                placeholder="Example: What is the average Sales?"
+                placeholder="Ask anything about your data..."
             )
 
             if st.button("✦ Generate Answer", type="primary"):
 
                 if question.strip():
 
-                    result = answer_question(cleaned, question)
+                    with st.spinner("AI is analysing your question..."):
 
-                    st.success("Analysis result")
-                    st.code(result, language="text")
+                        dataset_csv = cleaned.to_csv(index=False)
+
+                        if len(dataset_csv) <= 20000:
+                            dataset_context = (
+                                "Complete dataset:\n" + dataset_csv
+                            )
+                        else:
+                            dataset_context = (
+                                "Dataset is too large to send completely.\n"
+                                f"Total rows: {len(cleaned)}\n"
+                                f"Columns: {cleaned.columns.tolist()}\n"
+                                f"Data types:\n{cleaned.dtypes.to_string()}\n"
+                                f"Summary:\n{cleaned.describe(include='all').to_string()}\n"
+                                f"Sample records:\n{cleaned.head(10).to_string(index=False)}\n"
+                                "This is only a summary and sample, not the complete dataset."
+                            )
+
+                        result = ask_gemini(
+                            question,
+                            dataset_context
+                        )
+
+                    st.success("AI Response")
+                    st.write(result)
 
                 else:
                     st.warning("Please enter a question.")
 
         st.caption(
-            "Current question answering uses data-aware rules. "
-            "Live Gemini AI integration is not active yet."
+            "Powered by Google AI and your uploaded dataset."
         )
 
 
@@ -1162,14 +1310,6 @@ elif page == "Reports":
                 file_name="analysis_report.txt",
                 mime="text/plain"
             )
-
-    with st.container(border=True):
-        section_heading(
-            "Report preview",
-            "Preview the contents before downloading."
-        )
-
-        st.code(report_text, language="text")
 
 
 # --------------------------------------------------
